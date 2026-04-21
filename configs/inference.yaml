@@ -1,0 +1,3 @@
+model_path: models/best.onnx
+confidence: 0.5
+source: camera
