@@ -1,3 +1,6 @@
-model_path: models/best.onnx
-confidence: 0.5
-source: camera
+model_path: runs/train/wheelchair_detector/weights/best.pt
+source: sample.jpg
+conf: 0.5
+save: true
+show: false
+device: 0

@@ -1,5 +1,9 @@
+from ultralytics import YOLO
+
+
 def export_model():
-    print("Export model script placeholder")
+    model = YOLO("runs/train/wheelchair_detector/weights/best.pt")
+    model.export(format="onnx")
 
 
 if __name__ == "__main__":
