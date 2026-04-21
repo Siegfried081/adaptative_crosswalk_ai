@@ -24,15 +24,11 @@ def validate_config(config: dict) -> None:
 
     missing_keys = [key for key in required_keys if key not in config]
     if missing_keys:
-        raise ValueError(
-            f"Missing required config keys in train.yaml: {missing_keys}"
-        )
+        raise ValueError(f"Missing required config keys in train.yaml: {missing_keys}")
 
     data_path = Path(config["data"])
     if not data_path.exists():
-        raise FileNotFoundError(
-            f"Dataset config file not found: {data_path}"
-        )
+        raise FileNotFoundError(f"Dataset config file not found: {data_path}")
 
 
 def train() -> None:
