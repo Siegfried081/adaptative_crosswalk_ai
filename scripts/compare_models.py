@@ -47,7 +47,8 @@ def evaluate_model(
 def compare(
     challenger: dict, champion: dict, min_improvement: float = 0.0
 ) -> bool:
-    return challenger["map50"] >= champion["map50"] + min_improvement
+    delta = challenger["map50"] - champion["map50"]
+    return delta >= min_improvement - 1e-9
 
 
 def print_report(challenger: dict, champion: dict, promoted: bool) -> None:
