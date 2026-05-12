@@ -45,9 +45,7 @@ def evaluate_model(
     }
 
 
-def compare(
-    challenger: dict, champion: dict, min_improvement: float = 0.0
-) -> bool:
+def compare(challenger: dict, champion: dict, min_improvement: float = 0.0) -> bool:
     delta = challenger["map50"] - champion["map50"]
     return delta >= min_improvement - 1e-9
 
