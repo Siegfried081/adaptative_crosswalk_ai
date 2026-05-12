@@ -36,6 +36,8 @@ jobs:
     name: Model Validation
     runs-on: ubuntu-latest
     needs: quality
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -55,13 +57,26 @@ jobs:
         run: python scripts/download_dataset.py
 
       - name: Compare challenger vs champion
+        id: compare
         run: |
           if [ ! -f models/challenger.pt ]; then
             echo "No challenger model found, skipping validation."
+            echo "has_challenger=false" >> $GITHUB_OUTPUT
             exit 0
           fi
+          echo "has_challenger=true" >> $GITHUB_OUTPUT
           DATA_YAML=$(cat .dataset_location)
           python scripts/compare_models.py --data "$DATA_YAML"
+
+      - name: Promote challenger to champion
+        if: steps.compare.outputs.has_challenger == 'true'
+        run: |
+          cp models/challenger.pt models/champion.pt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/champion.pt
+          git commit -m "chore: auto-promote challenger to champion [skip ci]"
+          git push
 
       - name: Upload evaluation report
         if: always()
