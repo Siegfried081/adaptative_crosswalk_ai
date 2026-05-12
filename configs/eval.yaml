@@ -1,0 +1,7 @@
+challenger_model: models/challenger.pt
+champion_model: models/champion.pt
+data: dataset/data.yaml
+conf: 0.5
+device: cpu
+# challenger must exceed champion map50 by at least this value to be promoted
+min_map50_improvement: 0.0
