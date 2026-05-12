@@ -1,3 +1,4 @@
+import argparse
 import json
 import sys
 import time
@@ -79,12 +80,16 @@ def save_report(report: dict) -> None:
 
 
 def run() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, default=None)
+    args = parser.parse_args()
+
     config = load_config()
     validate_config(config)
 
     challenger_path = Path(config["challenger_model"])
     champion_path = Path(config["champion_model"])
-    data = config["data"]
+    data = args.data if args.data else config["data"]
     conf = config["conf"]
     device = config.get("device", "cpu")
     min_improvement = config.get("min_map50_improvement", 0.0)

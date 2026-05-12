@@ -49,13 +49,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Download test dataset from Roboflow
+        env:
+          ROBOFLOW_API_KEY: ${{ secrets.ROBOFLOW_API_KEY }}
+        run: python scripts/download_dataset.py
+
       - name: Compare challenger vs champion
         run: |
           if [ ! -f models/challenger.pt ]; then
             echo "No challenger model found, skipping validation."
             exit 0
           fi
-          python scripts/compare_models.py
+          DATA_YAML=$(cat .dataset_location)
+          python scripts/compare_models.py --data "$DATA_YAML"
 
       - name: Upload evaluation report
         if: always()
