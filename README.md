@@ -26,7 +26,7 @@ CI: Model Validation
   - Evaluates challenger vs champion (mAP50, precision, recall)
   - Approves or rejects the challenger
       │
-      ├── APPROVED ──► promote challenger to champion
+      ├── APPROVED ──► CI auto-promotes challenger to champion and commits
       │
       └── REJECTED ──► champion remains, CI fails with metrics report
 ```
@@ -74,20 +74,11 @@ git commit -m "feat: add challenger model"
 git push
 ```
 
-### 3. CI validation
+### 3. CI validation and auto-promotion
 
-The pipeline runs automatically. The `validate` job downloads the test dataset from Roboflow and compares both models. Results are available as a workflow artifact (`eval-report`) in GitHub Actions.
+The pipeline runs automatically. The `validate` job downloads the test dataset from Roboflow and compares both models. If the challenger is approved, the CI **automatically copies it to `champion.pt` and commits back to the repository**. No manual step required.
 
-### 4. Promote to champion
-
-If the CI passes, promote the challenger:
-
-```bash
-copy models\challenger.pt models\champion.pt
-git add models\champion.pt
-git commit -m "chore: promote challenger to champion"
-git push
-```
+Results are available as a workflow artifact (`eval-report`) in GitHub Actions.
 
 ## Configuration
 
