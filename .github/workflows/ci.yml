@@ -75,9 +75,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add models/champion.pt
-          git commit -m "chore: auto-promote challenger to champion [skip ci]"
-          git push
-
+          
+          # Só commita se houver mudança real
+          if git diff --staged --quiet; then
+            echo "Champion já está idêntico ao challenger. Nada para promover."
+          else
+            git commit -m "chore: auto-promote challenger to champion [skip ci]"
+            git push
+          fi
+          
       - name: Upload evaluation report
         if: always()
         uses: actions/upload-artifact@v4
