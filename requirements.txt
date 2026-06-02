@@ -3,3 +3,4 @@ opencv-python
 numpy
 pyyaml
 roboflow
+flask>=3.0.0
