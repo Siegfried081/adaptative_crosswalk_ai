@@ -45,17 +45,22 @@ def evaluate_model(
     }
 
 
-def compare(challenger: dict, champion: dict, min_improvement: float = 0.0, recall_tolerance: float = 0.01) -> bool:
+def compare(
+    challenger: dict,
+    champion: dict,
+    min_improvement: float = 0.0,
+    recall_tolerance: float = 0.01,
+) -> bool:
     """Aceita o challenger se:
     - mAP@0.5 melhora pelo menos `min_improvement`, E
     - Recall não cai mais que `recall_tolerance` (1pp por padrão).
     """
     map_delta = challenger["map50"] - champion["map50"]
     recall_delta = challenger["recall"] - champion["recall"]
-    
+
     map_ok = map_delta >= min_improvement - 1e-9
     recall_ok = recall_delta >= -recall_tolerance
-    
+
     return map_ok and recall_ok
 
 
