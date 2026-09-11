@@ -10,7 +10,7 @@ import cv2
 from ultralytics import YOLO
 
 MODELO = "/home/mozardo/best480_ncnn_model"
-IMGSZ = 481
+IMGSZ = 480
 N_FRAMES = 100
 CONF = 0.25
 
