@@ -1,6 +1,6 @@
 ultralytics
 opencv-python
 numpy
-pyyaml
+pyyaml>=6.0
 roboflow
 flask>=3.0.0
