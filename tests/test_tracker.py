@@ -189,3 +189,52 @@ class TestExtrairDeteccoesUltralytics:
         assert boxes == []
         assert ids == []
         assert confs == []
+
+
+class TestDistanciaRestante:
+    """A distância restante usa o sentido da travessia inferido do próprio track."""
+
+    def _tracker(self):
+        H = _homografia_sintetica()
+        return H, MultiObjectTracker(
+            homografia=H,
+            cantos_faixa_px=CANTOS_PX,
+            velocidade_fallback_ms=0.7,
+            comprimento_travessia_m=12.0,
+        )
+
+    def _passo(self, H, tracker, track_id, y_mundo, tempo_s):
+        u, v = _ponto_imagem_para(H, x_mundo=2.0, y_mundo=y_mundo)
+        return tracker.processar_deteccoes(
+            boxes_xyxy=[_bbox_com_base_em(u, v)],
+            track_ids=[track_id],
+            confiancas=[0.9],
+            tempo_s=tempo_s,
+        )[0]
+
+    def test_sentido_crescente_usa_d_menos_y(self):
+        H, tracker = self._tracker()
+        obj = None
+        for i in range(10):
+            obj = self._passo(H, tracker, 1, 1.0 + 0.1 * i * 5, 0.1 * i)
+        assert obj.distancia_restante_m == pytest.approx(12.0 - 5.5, abs=0.2)
+
+    def test_sentido_decrescente_usa_y(self):
+        H, tracker = self._tracker()
+        obj = None
+        for i in range(10):
+            obj = self._passo(H, tracker, 2, 11.0 - 0.1 * i * 5, 0.1 * i)
+        assert obj.distancia_restante_m == pytest.approx(11.0 - 4.5, abs=0.2)
+
+    def test_sentido_desconhecido_usa_pior_caso(self):
+        H, tracker = self._tracker()
+        obj = self._passo(H, tracker, 3, 3.0, 0.0)
+        assert obj.distancia_restante_m == pytest.approx(9.0, abs=0.2)
+
+    def test_sem_comprimento_retorna_none(self):
+        H = _homografia_sintetica()
+        tracker = MultiObjectTracker(
+            homografia=H, cantos_faixa_px=CANTOS_PX, velocidade_fallback_ms=0.7
+        )
+        obj = self._passo(H, tracker, 4, 3.0, 0.0)
+        assert obj.distancia_restante_m is None

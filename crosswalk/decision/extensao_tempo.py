@@ -14,6 +14,21 @@ O princípio de engenharia por trás da escolha entre fontes é fail-safe: na
 dúvida, o sistema usa o valor mais conservador (mais lento), que SUPERESTIMA
 o tempo necessário. Um erro que dá tempo a mais é seguro; um que dá tempo a
 menos não é.
+
+Versão por CICLO DE VERDE (usada pela pipeline): o que importa não é o verde
+total programado, e sim QUANTO DO VERDE AINDA RESTA quando o cadeirante está
+atravessando, e QUANTO DA TRAVESSIA AINDA FALTA. Em termos de instante final:
+
+    fim_necessario = t_decorrido + D_restante / V          (quando ele terminaria)
+    extensao_total = clamp( fim_necessario - T_normal , 0 , T_max )
+
+O ControladorExtensaoCiclo guarda a extensão já concedida no ciclo e aplica
+duas regras de segurança:
+  - a extensão nunca diminui dentro do ciclo (não se "retira" tempo de quem
+    ainda pode estar atravessando);
+  - ao atingir o teto T_max (15 s), a extensão TRAVA nesse valor: nenhum
+    outro cadeirante que entre depois consegue estender além dele;
+  - passou o fim do verde (T_normal + extensão concedida), não se estende mais.
 """
 
 from __future__ import annotations
@@ -127,6 +142,92 @@ class EstimadorVelocidade:
             return self._velocidade_suave_ms, True
 
         return self.velocidade_fallback_ms, False
+
+
+def calcular_extensao_total_necessaria(
+    distancia_restante_m: float,
+    velocidade_ms: float,
+    tempo_normal_s: float,
+    tempo_decorrido_s: float,
+    tempo_extra_maximo_s: float,
+) -> float:
+    """Extensão TOTAL (desde o início do ciclo) para um cadeirante terminar a travessia.
+
+    fim_necessario = t_decorrido + D_restante / V
+    extensao_total = clamp(fim_necessario - T_normal, 0, T_max)
+    """
+    if velocidade_ms <= 0:
+        raise ValueError("velocidade_ms deve ser positiva")
+    if distancia_restante_m < 0:
+        raise ValueError("distancia_restante_m não pode ser negativa")
+    if tempo_decorrido_s < 0:
+        raise ValueError("tempo_decorrido_s não pode ser negativo")
+
+    fim_necessario_s = tempo_decorrido_s + distancia_restante_m / velocidade_ms
+    return clamp(fim_necessario_s - tempo_normal_s, 0.0, tempo_extra_maximo_s)
+
+
+@dataclass
+class ControladorExtensaoCiclo:
+    """Estado da extensão de UM ciclo de verde de pedestres.
+
+    Chame atualizar() a cada frame com os cadeirantes que estão na faixa e o
+    tempo decorrido desde que o verde abriu. Chame reiniciar() quando começar
+    um novo ciclo de verde.
+    """
+
+    semaphore: SemaphoreConfig
+    extensao_concedida_s: float = 0.0
+    travado_no_teto: bool = False
+
+    def reiniciar(self) -> None:
+        """Novo ciclo de verde: zera a extensão concedida e destrava o teto."""
+        self.extensao_concedida_s = 0.0
+        self.travado_no_teto = False
+
+    @property
+    def fim_do_verde_s(self) -> float:
+        """Instante (desde o início do ciclo) em que o verde acaba, com a extensão atual."""
+        return self.semaphore.tempo_verde_normal_s + self.extensao_concedida_s
+
+    def atualizar(
+        self,
+        cadeirantes: list[tuple[float, float]],
+        tempo_decorrido_s: float,
+    ) -> float:
+        """Atualiza e retorna a extensão TOTAL concedida no ciclo (segundos).
+
+        Args:
+            cadeirantes: lista de (velocidade_ms, distancia_restante_m), um por
+                cadeirante dentro da faixa neste frame.
+            tempo_decorrido_s: tempo desde que o verde abriu.
+        """
+        teto = self.semaphore.tempo_extra_maximo_s
+
+        # Regra do teto: depois de atingir o máximo, ninguém estende mais.
+        if self.travado_no_teto:
+            return self.extensao_concedida_s
+
+        # Verde já acabou: não dá para reabrir; mantém o que foi concedido.
+        if tempo_decorrido_s >= self.fim_do_verde_s:
+            return self.extensao_concedida_s
+
+        for velocidade_ms, distancia_restante_m in cadeirantes:
+            necessaria = calcular_extensao_total_necessaria(
+                distancia_restante_m=distancia_restante_m,
+                velocidade_ms=velocidade_ms,
+                tempo_normal_s=self.semaphore.tempo_verde_normal_s,
+                tempo_decorrido_s=tempo_decorrido_s,
+                tempo_extra_maximo_s=teto,
+            )
+            # Nunca diminui dentro do ciclo.
+            self.extensao_concedida_s = max(self.extensao_concedida_s, necessaria)
+
+        if self.extensao_concedida_s >= teto:
+            self.extensao_concedida_s = teto
+            self.travado_no_teto = True
+
+        return self.extensao_concedida_s
 
 
 def decidir_extensao(

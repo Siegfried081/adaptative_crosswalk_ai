@@ -28,7 +28,7 @@ import numpy as np
 
 from crosswalk.config import SiteConfig
 from crosswalk.control.signal_controller import MockSignalController
-from crosswalk.decision.extensao_tempo import decidir_extensao
+from crosswalk.decision.extensao_tempo import ControladorExtensaoCiclo
 from crosswalk.tracking.tracker import MultiObjectTracker, extrair_deteccoes_ultralytics
 
 
@@ -45,6 +45,7 @@ def _desenhar_overlay(
     cantos_faixa_px: list[list[float]],
     tempo_extra_atual: float,
     fps_processamento: float | None = None,
+    status_verde: str | None = None,
 ) -> np.ndarray:
     """Desenha bounding boxes, IDs, velocidades, a região da faixa e o painel de status."""
     vis = frame.copy()
@@ -72,6 +73,8 @@ def _desenhar_overlay(
         f"Extensao atual: {tempo_extra_atual:.1f}s   |   "
         f"Cadeirantes na faixa: {sum(o.dentro_da_faixa for o in objetos)}"
     )
+    if status_verde:
+        texto_status += f"   |   {status_verde}"
     if fps_processamento is not None:
         texto_status += f"   |   {fps_processamento:.1f} FPS"
     cv2.putText(
@@ -91,6 +94,7 @@ def rodar_pipeline(
     mostrar: bool = False,
     captura_largura: int | None = None,
     captura_altura: int | None = None,
+    verde_inicio_s: float = 0.0,
 ) -> MockSignalController:
     """Executa a pipeline completa sobre um arquivo de vídeo OU uma webcam (índice int).
 
@@ -127,7 +131,9 @@ def rodar_pipeline(
         homografia=homografia,
         cantos_faixa_px=cantos_faixa_px,
         velocidade_fallback_ms=site.semaphore.velocidade_cadeirante_fallback_ms,
+        comprimento_travessia_m=distancia_m,
     )
+    ciclo = ControladorExtensaoCiclo(site.semaphore)
     controller = MockSignalController(verboso=True)
 
     writer = None
@@ -147,6 +153,8 @@ def rodar_pipeline(
     )
     if ao_vivo:
         print("Pressione ESC na janela para encerrar.")
+        if mostrar:
+            print("Pressione G na janela para iniciar um NOVO ciclo de verde.")
 
     while True:
         ok, frame = cap.read()
@@ -172,10 +180,13 @@ def rodar_pipeline(
         )
         tracker.limpar_tracks_inativos(set(track_ids))
 
-        velocidades_na_faixa = [o.velocidade_ms for o in objetos if o.dentro_da_faixa]
-        tempo_extra = decidir_extensao(
-            velocidades_na_faixa, site.semaphore, distancia_m
-        )
+        cadeirantes_na_faixa = [
+            (o.velocidade_ms, o.distancia_restante_m)
+            for o in objetos
+            if o.dentro_da_faixa and o.distancia_restante_m is not None
+        ]
+        verde_decorrido_s = tempo_s - verde_inicio_s
+        tempo_extra = ciclo.atualizar(cadeirantes_na_faixa, verde_decorrido_s)
         controller.estender_verde(tempo_extra)
 
         frames_desde_log += 1
@@ -185,16 +196,30 @@ def rodar_pipeline(
             frames_desde_log = 0
             t_ultimo_log_fps = agora
 
+        status_verde = (
+            f"Verde: {max(verde_decorrido_s, 0.0):.1f}/{ciclo.fim_do_verde_s:.1f}s"
+            + (" TETO" if ciclo.travado_no_teto else "")
+        )
         vis = _desenhar_overlay(
-            frame, objetos, cantos_faixa_px, tempo_extra, fps_processamento
+            frame,
+            objetos,
+            cantos_faixa_px,
+            tempo_extra,
+            fps_processamento,
+            status_verde,
         )
 
         if writer:
             writer.write(vis)
         if mostrar:
             cv2.imshow("Pipeline - semáforo adaptativo", vis)
-            if cv2.waitKey(1) & 0xFF == 27:
+            tecla = cv2.waitKey(1) & 0xFF
+            if tecla == 27:
                 break
+            if tecla in (ord("g"), ord("G")):
+                verde_inicio_s = tempo_s
+                ciclo.reiniciar()
+                print("[Ciclo] novo ciclo de verde iniciado.")
 
         frame_idx += 1
 
@@ -243,6 +268,15 @@ def main():
     parser.add_argument(
         "--captura-altura", type=int, default=None, help="Altura de captura da webcam"
     )
+    parser.add_argument(
+        "--verde-inicio-s",
+        type=float,
+        default=0.0,
+        help=(
+            "Instante (s) da fonte de vídeo em que o verde de pedestres abriu "
+            "(padrão 0 = começa junto com a execução). Ao vivo, use a tecla G."
+        ),
+    )
     args = parser.parse_args()
 
     rodar_pipeline(
@@ -255,6 +289,7 @@ def main():
         mostrar=args.mostrar,
         captura_largura=args.captura_largura,
         captura_altura=args.captura_altura,
+        verde_inicio_s=args.verde_inicio_s,
     )
 
 
