@@ -36,6 +36,13 @@ class ObjetoRastreado:
     velocidade_ms: float
     usou_medicao: bool
     dentro_da_faixa: bool
+    # Distância (m) que ainda falta para ele terminar a travessia. None se o
+    # tracker não conhece o comprimento da travessia.
+    distancia_restante_m: float | None = None
+
+
+# Deslocamento mínimo (m) para considerar que o sentido da travessia é conhecido.
+DESLOCAMENTO_MINIMO_SENTIDO_M = 0.5
 
 
 class MultiObjectTracker:
@@ -48,8 +55,12 @@ class MultiObjectTracker:
         homografia: np.ndarray,
         cantos_faixa_px: list[list[float]],
         velocidade_fallback_ms: float,
+        comprimento_travessia_m: float | None = None,
     ):
         self.homografia = homografia
+        self.comprimento_travessia_m = comprimento_travessia_m
+        self._y_inicial_m: dict[int, float] = {}
+        self._sentido: dict[int, int] = {}
         self.cantos_faixa_px = cantos_faixa_px
         self.velocidade_fallback_ms = velocidade_fallback_ms
         self._estimadores: dict[int, EstimadorVelocidade] = {}
@@ -60,6 +71,33 @@ class MultiObjectTracker:
                 velocidade_fallback_ms=self.velocidade_fallback_ms
             )
         return self._estimadores[track_id]
+
+    def _distancia_restante_m(self, track_id: int, y_m: float) -> float | None:
+        """Distância que falta até o fim da travessia, no sentido em que ele anda.
+
+        O eixo Y do mundo vai de 0 (lado da câmera) a D (lado oposto). O sentido
+        é inferido do deslocamento do próprio track. Enquanto ele ainda não se
+        moveu o suficiente, usa o PIOR CASO (o maior entre Y e D - Y): na dúvida,
+        assume o trecho mais longo (fail-safe, como no resto do sistema).
+        """
+        d = self.comprimento_travessia_m
+        if d is None:
+            return None
+
+        y = min(max(y_m, 0.0), d)
+        y0 = self._y_inicial_m.setdefault(track_id, y)
+
+        if track_id not in self._sentido and abs(y - y0) >= (
+            DESLOCAMENTO_MINIMO_SENTIDO_M
+        ):
+            self._sentido[track_id] = 1 if y > y0 else -1
+
+        sentido = self._sentido.get(track_id)
+        if sentido == 1:
+            return d - y
+        if sentido == -1:
+            return y
+        return max(y, d - y)
 
     def processar_deteccoes(
         self,
@@ -101,6 +139,9 @@ class MultiObjectTracker:
                     velocidade_ms=velocidade,
                     usou_medicao=usou_medicao,
                     dentro_da_faixa=dentro_da_faixa(ponto_solo, self.cantos_faixa_px),
+                    distancia_restante_m=self._distancia_restante_m(
+                        track_id, posicao_mundo_tupla[1]
+                    ),
                 )
             )
 
@@ -116,6 +157,8 @@ class MultiObjectTracker:
         for track_id in list(self._estimadores.keys()):
             if track_id not in track_ids_ativos:
                 del self._estimadores[track_id]
+                self._y_inicial_m.pop(track_id, None)
+                self._sentido.pop(track_id, None)
 
 
 def extrair_deteccoes_ultralytics(resultado) -> tuple[list, list, list]:

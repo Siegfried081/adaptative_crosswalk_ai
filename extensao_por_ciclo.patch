@@ -1,0 +1,524 @@
+diff --git a/crosswalk/decision/extensao_tempo.py b/crosswalk/decision/extensao_tempo.py
+index b6944ce..fa880fb 100644
+--- a/crosswalk/decision/extensao_tempo.py
++++ b/crosswalk/decision/extensao_tempo.py
+@@ -14,6 +14,21 @@ O princípio de engenharia por trás da escolha entre fontes é fail-safe: na
+ dúvida, o sistema usa o valor mais conservador (mais lento), que SUPERESTIMA
+ o tempo necessário. Um erro que dá tempo a mais é seguro; um que dá tempo a
+ menos não é.
++
++Versão por CICLO DE VERDE (usada pela pipeline): o que importa não é o verde
++total programado, e sim QUANTO DO VERDE AINDA RESTA quando o cadeirante está
++atravessando, e QUANTO DA TRAVESSIA AINDA FALTA. Em termos de instante final:
++
++    fim_necessario = t_decorrido + D_restante / V          (quando ele terminaria)
++    extensao_total = clamp( fim_necessario - T_normal , 0 , T_max )
++
++O ControladorExtensaoCiclo guarda a extensão já concedida no ciclo e aplica
++duas regras de segurança:
++  - a extensão nunca diminui dentro do ciclo (não se "retira" tempo de quem
++    ainda pode estar atravessando);
++  - ao atingir o teto T_max (15 s), a extensão TRAVA nesse valor: nenhum
++    outro cadeirante que entre depois consegue estender além dele;
++  - passou o fim do verde (T_normal + extensão concedida), não se estende mais.
+ """
+ 
+ from __future__ import annotations
+@@ -129,6 +144,92 @@ class EstimadorVelocidade:
+         return self.velocidade_fallback_ms, False
+ 
+ 
++def calcular_extensao_total_necessaria(
++    distancia_restante_m: float,
++    velocidade_ms: float,
++    tempo_normal_s: float,
++    tempo_decorrido_s: float,
++    tempo_extra_maximo_s: float,
++) -> float:
++    """Extensão TOTAL (desde o início do ciclo) para um cadeirante terminar a travessia.
++
++    fim_necessario = t_decorrido + D_restante / V
++    extensao_total = clamp(fim_necessario - T_normal, 0, T_max)
++    """
++    if velocidade_ms <= 0:
++        raise ValueError("velocidade_ms deve ser positiva")
++    if distancia_restante_m < 0:
++        raise ValueError("distancia_restante_m não pode ser negativa")
++    if tempo_decorrido_s < 0:
++        raise ValueError("tempo_decorrido_s não pode ser negativo")
++
++    fim_necessario_s = tempo_decorrido_s + distancia_restante_m / velocidade_ms
++    return clamp(fim_necessario_s - tempo_normal_s, 0.0, tempo_extra_maximo_s)
++
++
++@dataclass
++class ControladorExtensaoCiclo:
++    """Estado da extensão de UM ciclo de verde de pedestres.
++
++    Chame atualizar() a cada frame com os cadeirantes que estão na faixa e o
++    tempo decorrido desde que o verde abriu. Chame reiniciar() quando começar
++    um novo ciclo de verde.
++    """
++
++    semaphore: SemaphoreConfig
++    extensao_concedida_s: float = 0.0
++    travado_no_teto: bool = False
++
++    def reiniciar(self) -> None:
++        """Novo ciclo de verde: zera a extensão concedida e destrava o teto."""
++        self.extensao_concedida_s = 0.0
++        self.travado_no_teto = False
++
++    @property
++    def fim_do_verde_s(self) -> float:
++        """Instante (desde o início do ciclo) em que o verde acaba, com a extensão atual."""
++        return self.semaphore.tempo_verde_normal_s + self.extensao_concedida_s
++
++    def atualizar(
++        self,
++        cadeirantes: list[tuple[float, float]],
++        tempo_decorrido_s: float,
++    ) -> float:
++        """Atualiza e retorna a extensão TOTAL concedida no ciclo (segundos).
++
++        Args:
++            cadeirantes: lista de (velocidade_ms, distancia_restante_m), um por
++                cadeirante dentro da faixa neste frame.
++            tempo_decorrido_s: tempo desde que o verde abriu.
++        """
++        teto = self.semaphore.tempo_extra_maximo_s
++
++        # Regra do teto: depois de atingir o máximo, ninguém estende mais.
++        if self.travado_no_teto:
++            return self.extensao_concedida_s
++
++        # Verde já acabou: não dá para reabrir; mantém o que foi concedido.
++        if tempo_decorrido_s >= self.fim_do_verde_s:
++            return self.extensao_concedida_s
++
++        for velocidade_ms, distancia_restante_m in cadeirantes:
++            necessaria = calcular_extensao_total_necessaria(
++                distancia_restante_m=distancia_restante_m,
++                velocidade_ms=velocidade_ms,
++                tempo_normal_s=self.semaphore.tempo_verde_normal_s,
++                tempo_decorrido_s=tempo_decorrido_s,
++                tempo_extra_maximo_s=teto,
++            )
++            # Nunca diminui dentro do ciclo.
++            self.extensao_concedida_s = max(self.extensao_concedida_s, necessaria)
++
++        if self.extensao_concedida_s >= teto:
++            self.extensao_concedida_s = teto
++            self.travado_no_teto = True
++
++        return self.extensao_concedida_s
++
++
+ def decidir_extensao(
+     velocidades_ms: list[float],
+     semaphore_config: SemaphoreConfig,
+diff --git a/crosswalk/pipeline.py b/crosswalk/pipeline.py
+index 1e13ef2..207e0cc 100644
+--- a/crosswalk/pipeline.py
++++ b/crosswalk/pipeline.py
+@@ -28,7 +28,7 @@ import numpy as np
+ 
+ from crosswalk.config import SiteConfig
+ from crosswalk.control.signal_controller import MockSignalController
+-from crosswalk.decision.extensao_tempo import decidir_extensao
++from crosswalk.decision.extensao_tempo import ControladorExtensaoCiclo
+ from crosswalk.tracking.tracker import MultiObjectTracker, extrair_deteccoes_ultralytics
+ 
+ 
+@@ -45,6 +45,7 @@ def _desenhar_overlay(
+     cantos_faixa_px: list[list[float]],
+     tempo_extra_atual: float,
+     fps_processamento: float | None = None,
++    status_verde: str | None = None,
+ ) -> np.ndarray:
+     """Desenha bounding boxes, IDs, velocidades, a região da faixa e o painel de status."""
+     vis = frame.copy()
+@@ -72,6 +73,8 @@ def _desenhar_overlay(
+         f"Extensao atual: {tempo_extra_atual:.1f}s   |   "
+         f"Cadeirantes na faixa: {sum(o.dentro_da_faixa for o in objetos)}"
+     )
++    if status_verde:
++        texto_status += f"   |   {status_verde}"
+     if fps_processamento is not None:
+         texto_status += f"   |   {fps_processamento:.1f} FPS"
+     cv2.putText(
+@@ -91,6 +94,7 @@ def rodar_pipeline(
+     mostrar: bool = False,
+     captura_largura: int | None = None,
+     captura_altura: int | None = None,
++    verde_inicio_s: float = 0.0,
+ ) -> MockSignalController:
+     """Executa a pipeline completa sobre um arquivo de vídeo OU uma webcam (índice int).
+ 
+@@ -127,7 +131,9 @@ def rodar_pipeline(
+         homografia=homografia,
+         cantos_faixa_px=cantos_faixa_px,
+         velocidade_fallback_ms=site.semaphore.velocidade_cadeirante_fallback_ms,
++        comprimento_travessia_m=distancia_m,
+     )
++    ciclo = ControladorExtensaoCiclo(site.semaphore)
+     controller = MockSignalController(verboso=True)
+ 
+     writer = None
+@@ -147,6 +153,8 @@ def rodar_pipeline(
+     )
+     if ao_vivo:
+         print("Pressione ESC na janela para encerrar.")
++        if mostrar:
++            print("Pressione G na janela para iniciar um NOVO ciclo de verde.")
+ 
+     while True:
+         ok, frame = cap.read()
+@@ -172,10 +180,13 @@ def rodar_pipeline(
+         )
+         tracker.limpar_tracks_inativos(set(track_ids))
+ 
+-        velocidades_na_faixa = [o.velocidade_ms for o in objetos if o.dentro_da_faixa]
+-        tempo_extra = decidir_extensao(
+-            velocidades_na_faixa, site.semaphore, distancia_m
+-        )
++        cadeirantes_na_faixa = [
++            (o.velocidade_ms, o.distancia_restante_m)
++            for o in objetos
++            if o.dentro_da_faixa and o.distancia_restante_m is not None
++        ]
++        verde_decorrido_s = tempo_s - verde_inicio_s
++        tempo_extra = ciclo.atualizar(cadeirantes_na_faixa, verde_decorrido_s)
+         controller.estender_verde(tempo_extra)
+ 
+         frames_desde_log += 1
+@@ -185,16 +196,30 @@ def rodar_pipeline(
+             frames_desde_log = 0
+             t_ultimo_log_fps = agora
+ 
++        status_verde = (
++            f"Verde: {max(verde_decorrido_s, 0.0):.1f}/{ciclo.fim_do_verde_s:.1f}s"
++            + (" TETO" if ciclo.travado_no_teto else "")
++        )
+         vis = _desenhar_overlay(
+-            frame, objetos, cantos_faixa_px, tempo_extra, fps_processamento
++            frame,
++            objetos,
++            cantos_faixa_px,
++            tempo_extra,
++            fps_processamento,
++            status_verde,
+         )
+ 
+         if writer:
+             writer.write(vis)
+         if mostrar:
+             cv2.imshow("Pipeline - semáforo adaptativo", vis)
+-            if cv2.waitKey(1) & 0xFF == 27:
++            tecla = cv2.waitKey(1) & 0xFF
++            if tecla == 27:
+                 break
++            if tecla in (ord("g"), ord("G")):
++                verde_inicio_s = tempo_s
++                ciclo.reiniciar()
++                print("[Ciclo] novo ciclo de verde iniciado.")
+ 
+         frame_idx += 1
+ 
+@@ -243,6 +268,15 @@ def main():
+     parser.add_argument(
+         "--captura-altura", type=int, default=None, help="Altura de captura da webcam"
+     )
++    parser.add_argument(
++        "--verde-inicio-s",
++        type=float,
++        default=0.0,
++        help=(
++            "Instante (s) da fonte de vídeo em que o verde de pedestres abriu "
++            "(padrão 0 = começa junto com a execução). Ao vivo, use a tecla G."
++        ),
++    )
+     args = parser.parse_args()
+ 
+     rodar_pipeline(
+@@ -255,6 +289,7 @@ def main():
+         mostrar=args.mostrar,
+         captura_largura=args.captura_largura,
+         captura_altura=args.captura_altura,
++        verde_inicio_s=args.verde_inicio_s,
+     )
+ 
+ 
+diff --git a/crosswalk/tracking/tracker.py b/crosswalk/tracking/tracker.py
+index 9d9f230..eeca53d 100644
+--- a/crosswalk/tracking/tracker.py
++++ b/crosswalk/tracking/tracker.py
+@@ -36,6 +36,13 @@ class ObjetoRastreado:
+     velocidade_ms: float
+     usou_medicao: bool
+     dentro_da_faixa: bool
++    # Distância (m) que ainda falta para ele terminar a travessia. None se o
++    # tracker não conhece o comprimento da travessia.
++    distancia_restante_m: float | None = None
++
++
++# Deslocamento mínimo (m) para considerar que o sentido da travessia é conhecido.
++DESLOCAMENTO_MINIMO_SENTIDO_M = 0.5
+ 
+ 
+ class MultiObjectTracker:
+@@ -48,8 +55,12 @@ class MultiObjectTracker:
+         homografia: np.ndarray,
+         cantos_faixa_px: list[list[float]],
+         velocidade_fallback_ms: float,
++        comprimento_travessia_m: float | None = None,
+     ):
+         self.homografia = homografia
++        self.comprimento_travessia_m = comprimento_travessia_m
++        self._y_inicial_m: dict[int, float] = {}
++        self._sentido: dict[int, int] = {}
+         self.cantos_faixa_px = cantos_faixa_px
+         self.velocidade_fallback_ms = velocidade_fallback_ms
+         self._estimadores: dict[int, EstimadorVelocidade] = {}
+@@ -61,6 +72,33 @@ class MultiObjectTracker:
+             )
+         return self._estimadores[track_id]
+ 
++    def _distancia_restante_m(self, track_id: int, y_m: float) -> float | None:
++        """Distância que falta até o fim da travessia, no sentido em que ele anda.
++
++        O eixo Y do mundo vai de 0 (lado da câmera) a D (lado oposto). O sentido
++        é inferido do deslocamento do próprio track. Enquanto ele ainda não se
++        moveu o suficiente, usa o PIOR CASO (o maior entre Y e D - Y): na dúvida,
++        assume o trecho mais longo (fail-safe, como no resto do sistema).
++        """
++        d = self.comprimento_travessia_m
++        if d is None:
++            return None
++
++        y = min(max(y_m, 0.0), d)
++        y0 = self._y_inicial_m.setdefault(track_id, y)
++
++        if track_id not in self._sentido and abs(y - y0) >= (
++            DESLOCAMENTO_MINIMO_SENTIDO_M
++        ):
++            self._sentido[track_id] = 1 if y > y0 else -1
++
++        sentido = self._sentido.get(track_id)
++        if sentido == 1:
++            return d - y
++        if sentido == -1:
++            return y
++        return max(y, d - y)
++
+     def processar_deteccoes(
+         self,
+         boxes_xyxy: list[tuple[float, float, float, float]],
+@@ -101,6 +139,9 @@ class MultiObjectTracker:
+                     velocidade_ms=velocidade,
+                     usou_medicao=usou_medicao,
+                     dentro_da_faixa=dentro_da_faixa(ponto_solo, self.cantos_faixa_px),
++                    distancia_restante_m=self._distancia_restante_m(
++                        track_id, posicao_mundo_tupla[1]
++                    ),
+                 )
+             )
+ 
+@@ -116,6 +157,8 @@ class MultiObjectTracker:
+         for track_id in list(self._estimadores.keys()):
+             if track_id not in track_ids_ativos:
+                 del self._estimadores[track_id]
++                self._y_inicial_m.pop(track_id, None)
++                self._sentido.pop(track_id, None)
+ 
+ 
+ def extrair_deteccoes_ultralytics(resultado) -> tuple[list, list, list]:
+diff --git a/tests/test_extensao_ciclo.py b/tests/test_extensao_ciclo.py
+new file mode 100644
+index 0000000..667d85c
+--- /dev/null
++++ b/tests/test_extensao_ciclo.py
+@@ -0,0 +1,126 @@
++"""Testes da extensão por ciclo de verde: verde restante, distância restante e teto."""
++
++import pytest
++
++from crosswalk.config import SemaphoreConfig
++from crosswalk.decision.extensao_tempo import (
++    ControladorExtensaoCiclo,
++    calcular_extensao_total_necessaria,
++)
++
++
++def _config(verde=20.0, teto=15.0):
++    return SemaphoreConfig(tempo_verde_normal_s=verde, tempo_extra_maximo_s=teto)
++
++
++class TestExtensaoTotalNecessaria:
++    def test_exemplo_do_verde_restante(self):
++        """Verde 20 s, 10 s já passaram, ele precisa de 20 s: fim em 30 s -> +10 s."""
++        extra = calcular_extensao_total_necessaria(
++            distancia_restante_m=10,
++            velocidade_ms=0.5,
++            tempo_normal_s=20,
++            tempo_decorrido_s=10,
++            tempo_extra_maximo_s=15,
++        )
++        assert extra == pytest.approx(10.0)
++
++    def test_inicio_do_verde_equivale_a_formula_antiga(self):
++        extra = calcular_extensao_total_necessaria(
++            distancia_restante_m=10,
++            velocidade_ms=0.5,
++            tempo_normal_s=15,
++            tempo_decorrido_s=0,
++            tempo_extra_maximo_s=15,
++        )
++        assert extra == pytest.approx(5.0)
++
++    def test_termina_dentro_do_verde_nao_estende(self):
++        extra = calcular_extensao_total_necessaria(
++            distancia_restante_m=3,
++            velocidade_ms=0.7,
++            tempo_normal_s=20,
++            tempo_decorrido_s=10,
++            tempo_extra_maximo_s=15,
++        )
++        assert extra == 0.0
++
++    def test_limitado_ao_teto(self):
++        extra = calcular_extensao_total_necessaria(
++            distancia_restante_m=20,
++            velocidade_ms=0.3,
++            tempo_normal_s=20,
++            tempo_decorrido_s=10,
++            tempo_extra_maximo_s=15,
++        )
++        assert extra == 15.0
++
++    @pytest.mark.parametrize(
++        "kwargs",
++        [
++            dict(velocidade_ms=0),
++            dict(distancia_restante_m=-1),
++            dict(tempo_decorrido_s=-1),
++        ],
++    )
++    def test_entradas_invalidas_levantam_erro(self, kwargs):
++        base = dict(
++            distancia_restante_m=5,
++            velocidade_ms=0.7,
++            tempo_normal_s=20,
++            tempo_decorrido_s=0,
++            tempo_extra_maximo_s=15,
++        )
++        base.update(kwargs)
++        with pytest.raises(ValueError):
++            calcular_extensao_total_necessaria(**base)
++
++
++class TestControladorExtensaoCiclo:
++    def test_sem_cadeirantes_nao_estende(self):
++        c = ControladorExtensaoCiclo(_config())
++        assert c.atualizar([], tempo_decorrido_s=5.0) == 0.0
++
++    def test_cadeirante_que_entra_tarde_recebe_extensao(self):
++        c = ControladorExtensaoCiclo(_config(verde=20))
++        assert c.atualizar([(0.5, 10.0)], tempo_decorrido_s=10.0) == pytest.approx(10.0)
++
++    def test_extensao_nunca_diminui_no_ciclo(self):
++        c = ControladorExtensaoCiclo(_config(verde=20))
++        c.atualizar([(0.5, 10.0)], tempo_decorrido_s=10.0)  # +10 s
++        # Ele acelera / avança: a necessidade cai, mas a concedida permanece.
++        assert c.atualizar([(1.0, 2.0)], tempo_decorrido_s=14.0) == pytest.approx(10.0)
++
++    def test_multiplos_cadeirantes_prevalece_o_mais_lento(self):
++        c = ControladorExtensaoCiclo(_config(verde=15))
++        extra = c.atualizar([(0.5, 10.0), (1.5, 10.0)], tempo_decorrido_s=0.0)
++        assert extra == pytest.approx(5.0)
++
++    def test_teto_trava_e_outro_cadeirante_nao_estende_alem(self):
++        c = ControladorExtensaoCiclo(_config(verde=20, teto=15))
++        # Primeiro cadeirante muito lento: atinge o teto de 15 s.
++        assert c.atualizar([(0.2, 10.0)], tempo_decorrido_s=0.0) == 15.0
++        assert c.travado_no_teto is True
++        # Outro cadeirante, ainda mais lento, entra depois: continua 15 s.
++        assert c.atualizar([(0.1, 12.0)], tempo_decorrido_s=5.0) == 15.0
++
++    def test_verde_encerrado_nao_aceita_nova_extensao(self):
++        c = ControladorExtensaoCiclo(_config(verde=20))
++        # Entra depois do fim do verde (20 s): nada a fazer.
++        assert c.atualizar([(0.3, 10.0)], tempo_decorrido_s=21.0) == 0.0
++
++    def test_fim_do_verde_considera_a_extensao_concedida(self):
++        c = ControladorExtensaoCiclo(_config(verde=20))
++        c.atualizar([(0.5, 10.0)], tempo_decorrido_s=10.0)  # concede 10 s
++        assert c.fim_do_verde_s == pytest.approx(30.0)
++        # Ainda dentro do verde estendido (25 s < 30 s): pode estender mais.
++        assert c.atualizar([(0.2, 10.0)], tempo_decorrido_s=25.0) == 15.0
++
++    def test_reiniciar_zera_o_ciclo(self):
++        c = ControladorExtensaoCiclo(_config(verde=20, teto=15))
++        c.atualizar([(0.2, 10.0)], tempo_decorrido_s=0.0)
++        assert c.travado_no_teto is True
++        c.reiniciar()
++        assert c.extensao_concedida_s == 0.0
++        assert c.travado_no_teto is False
++        assert c.atualizar([], tempo_decorrido_s=1.0) == 0.0
+diff --git a/tests/test_tracker.py b/tests/test_tracker.py
+index 71f3c47..5937384 100644
+--- a/tests/test_tracker.py
++++ b/tests/test_tracker.py
+@@ -189,3 +189,52 @@ class TestExtrairDeteccoesUltralytics:
+         assert boxes == []
+         assert ids == []
+         assert confs == []
++
++
++class TestDistanciaRestante:
++    """A distância restante usa o sentido da travessia inferido do próprio track."""
++
++    def _tracker(self):
++        H = _homografia_sintetica()
++        return H, MultiObjectTracker(
++            homografia=H,
++            cantos_faixa_px=CANTOS_PX,
++            velocidade_fallback_ms=0.7,
++            comprimento_travessia_m=12.0,
++        )
++
++    def _passo(self, H, tracker, track_id, y_mundo, tempo_s):
++        u, v = _ponto_imagem_para(H, x_mundo=2.0, y_mundo=y_mundo)
++        return tracker.processar_deteccoes(
++            boxes_xyxy=[_bbox_com_base_em(u, v)],
++            track_ids=[track_id],
++            confiancas=[0.9],
++            tempo_s=tempo_s,
++        )[0]
++
++    def test_sentido_crescente_usa_d_menos_y(self):
++        H, tracker = self._tracker()
++        obj = None
++        for i in range(10):
++            obj = self._passo(H, tracker, 1, 1.0 + 0.1 * i * 5, 0.1 * i)
++        assert obj.distancia_restante_m == pytest.approx(12.0 - 5.5, abs=0.2)
++
++    def test_sentido_decrescente_usa_y(self):
++        H, tracker = self._tracker()
++        obj = None
++        for i in range(10):
++            obj = self._passo(H, tracker, 2, 11.0 - 0.1 * i * 5, 0.1 * i)
++        assert obj.distancia_restante_m == pytest.approx(11.0 - 4.5, abs=0.2)
++
++    def test_sentido_desconhecido_usa_pior_caso(self):
++        H, tracker = self._tracker()
++        obj = self._passo(H, tracker, 3, 3.0, 0.0)
++        assert obj.distancia_restante_m == pytest.approx(9.0, abs=0.2)
++
++    def test_sem_comprimento_retorna_none(self):
++        H = _homografia_sintetica()
++        tracker = MultiObjectTracker(
++            homografia=H, cantos_faixa_px=CANTOS_PX, velocidade_fallback_ms=0.7
++        )
++        obj = self._passo(H, tracker, 4, 3.0, 0.0)
++        assert obj.distancia_restante_m is None
